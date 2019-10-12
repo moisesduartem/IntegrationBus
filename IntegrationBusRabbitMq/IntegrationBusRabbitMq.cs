@@ -23,7 +23,7 @@ namespace IntegrationBusRabbitMq
         private readonly string _brokerName;
         private readonly string _queueName;
 
-        private const string BROKER_TYPE = "topic";
+        private const string BrokerType = "topic";
 
         private readonly int _publishRetryAttempts;
         private readonly int _consumeRetryAttempts;
@@ -58,7 +58,7 @@ namespace IntegrationBusRabbitMq
 
             var channel = _connectionPersister.CreateModel();
 
-            channel.ExchangeDeclare(_brokerName, BROKER_TYPE);
+            channel.ExchangeDeclare(_brokerName, BrokerType);
             channel.QueueDeclare(queueName, true, false, false, null);
 
             channel.CallbackException += (sender, ea) =>
@@ -155,7 +155,7 @@ namespace IntegrationBusRabbitMq
             {
                 var eventName = @event.GetType().Name;
 
-                channel.ExchangeDeclare(_brokerName, BROKER_TYPE);
+                channel.ExchangeDeclare(_brokerName, BrokerType);
 
                 var message = JsonConvert.SerializeObject(@event);
                 var body = Encoding.UTF8.GetBytes(message);

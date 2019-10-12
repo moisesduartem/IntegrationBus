@@ -2,12 +2,12 @@
 
 namespace IntegrationBus
 {
-    public class IntegrationEvent
+    public abstract class IntegrationEvent
     {
         public Guid EventId { get; }
         public DateTime CreationDate { get; }
 
-        public IntegrationEvent()
+        protected IntegrationEvent()
         {
             EventId = Guid.NewGuid();
             CreationDate = DateTime.UtcNow;

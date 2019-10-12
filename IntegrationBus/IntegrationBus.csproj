@@ -2,6 +2,14 @@
 
   <PropertyGroup>
     <TargetFramework>netcoreapp2.2</TargetFramework>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <Version>0.1.0</Version>
+    <Authors>Maycon Teixeira</Authors>
+    <Company>Maycon Teixeira</Company>
+    <Description>A nuget package to help services/APIs have a uncoupled communication</Description>
+    <Copyright>Maycon Teixeira</Copyright>
+    <RepositoryUrl>https://github.com/mteixeira-devlopment/IntegrationBus</RepositoryUrl>
+    <PackageTags>rabbitmq, microservice, eventbus</PackageTags>
   </PropertyGroup>
 
 </Project>
