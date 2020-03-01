@@ -1,7 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
-
+﻿
 namespace IntegrationBus
 {
     public interface IIntegrationBus
@@ -10,15 +7,17 @@ namespace IntegrationBus
         /// Publish a event to service queue with de routing key the same as @event name.
         /// </summary>
         /// <param name="event"></param>
-        void Publish(IntegrationEvent @event);
+        bool Publish(IntegrationEvent @event);
 
         /// <summary>
         /// Subscribe a event with event handler.
         /// </summary>
         /// <typeparam name="TEvent"></typeparam>
         /// <typeparam name="TEventHandler"></typeparam>
-        void Subscribe<TEvent, TEventHandler>()
-            where TEvent : IntegrationEvent 
+        ISubscription Subscribe<TEvent, TEventHandler>(int consumersAmount = -1)
+            where TEvent : IntegrationEvent
             where TEventHandler : IIntegrationEventHandler<TEvent>;
+
+        void EnableConsume();
     }
 }

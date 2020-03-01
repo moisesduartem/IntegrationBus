@@ -1,6 +1,7 @@
 ﻿using System;
-using System.IO;
+using System.Collections.Concurrent;
 using System.Net.Sockets;
+using IntegrationBusRabbitMq.Exceptions;
 using Polly;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
@@ -8,59 +9,39 @@ using RabbitMQ.Client.Exceptions;
 
 namespace IntegrationBusRabbitMq
 {
-    public interface IBusConnectionPersister : IDisposable
-    {
-        bool IsConnected { get; }
-
-        IModel CreateModel();
-        bool TryConnect();
-    }
-
     public class BusConnectionPersister : IBusConnectionPersister
     {
-        /// <summary>
-        /// RabbitMq connection factory.
-        /// </summary>
+        // RabbitMq connection factory
         private readonly IConnectionFactory _connectionFactory;
      
         private readonly int _retryAttempts;
 
-        /// <summary>
-        /// AMQP connection.
-        /// </summary>
+        // AMQP connection
         private IConnection _connection;
         private bool _disposed;
 
         private readonly object _connectionLock = new object();
 
+        private readonly ConcurrentBag<IModel> _channelPool;
+        private readonly ConcurrentBag<IModel> _consumerPool;
+
+        public bool IsConnected => _connection != null && _connection.IsOpen && !_disposed;
+               
         public BusConnectionPersister(IConnectionFactory connectionFactory, int retryAttempts)
         {
             _connectionFactory = connectionFactory ?? throw new ArgumentNullException(nameof(connectionFactory));
             _retryAttempts = retryAttempts;
+
+            _channelPool = new ConcurrentBag<IModel>();
+            _consumerPool = new ConcurrentBag<IModel>();
         }
-
-        public bool IsConnected => _connection != null && _connection.IsOpen && !_disposed;
-
-        /// <summary>
-        /// Create and return a new session and model to connection.
-        /// </summary>
-        /// <returns></returns>
-        public IModel CreateModel()
-        {
-            if (!IsConnected)
-                throw new InvalidOperationException("Nenhuma conexão com RabbitMq está disponível para completar esta ação.");
-
-            return _connection.CreateModel();
-        }
-
-        /// <summary>
-        /// Execute connection try to RabbitMq.
-        /// </summary>
-        /// <returns></returns>
+       
         public bool TryConnect()
         {
             lock (_connectionLock)
             {
+                if (IsConnected) return true;
+
                 var policy = Policy
                     .Handle<SocketException>()
                     .Or<BrokerUnreachableException>()
@@ -72,7 +53,6 @@ namespace IntegrationBusRabbitMq
 
                 HandleConnectionPersisted();
                 return true;
-
             }
         }
        
@@ -101,11 +81,30 @@ namespace IntegrationBusRabbitMq
             TryConnect();
         }
 
+        public IModel TakeAChannel()
+        {
+            if (!IsConnected) throw new MissConnectionException();
+            if (_channelPool == null) throw new Exception("Não pode estar nulo!");
+
+            var taked = _channelPool.TryTake(out var channel);
+            if (taked) return channel;
+
+            return _connection.CreateModel();
+        }
+
+        public void GiveChannel(IModel channel) => _channelPool.Add(channel);
+
+        public void SaveConsumerChannel(IModel channel) => _consumerPool.Add(channel);
+
         public void Dispose()
         {
             if (!_disposed) return;
 
             _disposed = true;
+
+            _channelPool.Clear();
+            _consumerPool.Clear();
+
             _connection.Dispose();
         }
     }

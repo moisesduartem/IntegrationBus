@@ -1,12 +1,14 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
 using IntegrationBus;
+using IntegrationBusRabbitMq.Extensions;
 using Microsoft.Extensions.DependencyInjection;
 using Newtonsoft.Json;
 using Polly;
-using Polly.Retry;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using RabbitMQ.Client.Exceptions;
@@ -20,20 +22,26 @@ namespace IntegrationBusRabbitMq
         private readonly IBusConnectionPersister _connectionPersister;
         private readonly IMemorySubscriptionManager _inMemorySubscriptionManager;
 
-        private readonly string _brokerName;
-        private readonly string _queueName;
+        private readonly string _gatewayBrokerName;
+        private readonly string _serviceName;
 
-        private const string BrokerType = "topic";
+        private const string GatewayBrokerType = "topic";
+        private const string ServiceBrokerType = "fanout";
 
-        private readonly int _publishRetryAttempts;
-        private readonly int _consumeRetryAttempts;
+        private const string PublishRetryAttemptsConfigKey = "PublishRetryAttempts";
+        private const string ConsumeRetryAttemptsConfigKey = "ConsumeRetryAttempts";
+        private const string ConsumeConcurrentsDefaultAmountConfigKey = "ConsumeConcurrentsDefaultAmount";
 
-        private IModel _consumerChannel;
+        private readonly IDictionary<string, object> _configuration;
+
+        public static object AckLock = new object();
+        private bool _enableConsume = false;
 
         public IntegrationBusRabbitMq(
             IServiceProvider serviceProvider,
-            (string brokerName, string queueName) configurationNames,
-            (int publishRetryAttempts, int consumeRetryAttempts) retryAttempts)
+            (string brokerName, string serviceName) brokers,
+            (int publishRetryAttempts, int consumeRetryAttempts) retryAttempts,
+            int consumeConcurrentsDefaultAmount)
         {
             _connectionPersister = serviceProvider.GetRequiredService<IBusConnectionPersister>() 
                                    ?? throw new ArgumentNullException(nameof(_connectionPersister));
@@ -43,74 +51,99 @@ namespace IntegrationBusRabbitMq
 
             _serviceProvider = serviceProvider;
 
-            _brokerName = configurationNames.brokerName;
-            _queueName = configurationNames.queueName;
+            _gatewayBrokerName = brokers.brokerName;
+            _serviceName = brokers.serviceName;
 
-            _publishRetryAttempts = retryAttempts.publishRetryAttempts;
-            _consumeRetryAttempts = retryAttempts.consumeRetryAttempts;
-
-            _consumerChannel = CreateConsumerChannel(_queueName);
+            _configuration = new Dictionary<string, object>
+            {
+                [PublishRetryAttemptsConfigKey] = retryAttempts.publishRetryAttempts,
+                [ConsumeRetryAttemptsConfigKey] = retryAttempts.consumeRetryAttempts,
+                [ConsumeConcurrentsDefaultAmountConfigKey] = consumeConcurrentsDefaultAmount
+            };
         }
 
-        private IModel CreateConsumerChannel(string queueName)
+        private IModel CreateConsumerChannel()
         {
             if (!_connectionPersister.IsConnected) _connectionPersister.TryConnect();
 
-            var channel = _connectionPersister.CreateModel();
+            var channel = _connectionPersister.TakeAChannel();
+            
 
-            channel.ExchangeDeclare(_brokerName, BrokerType);
-            channel.QueueDeclare(queueName, true, false, false, null);
+            //channel.CallbackException += (sender, ea) =>
+            //{
+            //    _consumerChannel.Dispose();
 
-            channel.CallbackException += (sender, ea) =>
-            {
-                _consumerChannel.Dispose();
-
-                _consumerChannel = CreateConsumerChannel(queueName);
-                StartBasicConsume();
-            };
+            //    _consumerChannel = CreateConsumerChannel(queueName);
+            //    StartBasicConsume();
+            //};
 
             return channel;
         }
 
-        private void StartBasicConsume()
-        {
-            if (_consumerChannel == null) return;
-
-            var consumer = new AsyncEventingBasicConsumer(_consumerChannel);
+        private void StartBasicConsume(IModel channel, string eventName, string consumerTag)
+        {  
+            var consumer = new AsyncEventingBasicConsumer(channel);
             consumer.Received += ConsumerReceived;
 
-            _consumerChannel.BasicConsume(_queueName, false, consumer);
+            channel.BasicConsume(eventName, false, consumer);
+            _connectionPersister.SaveConsumerChannel(channel);
         }
 
         private async Task ConsumerReceived(object sender, BasicDeliverEventArgs eventArgs)
         {
-            var eventName = eventArgs.RoutingKey;
+            while (!_enableConsume) { }
+
+            var routingKey = eventArgs.RoutingKey;
+
             var message = Encoding.UTF8.GetString(eventArgs.Body);
 
-            if (_inMemorySubscriptionManager.HasHandlerForEvent(eventName))
+            if (_inMemorySubscriptionManager.HasHandlerForEvent(routingKey))
             {
-                var handlers = _inMemorySubscriptionManager.GetHandlersForEvent(eventName);
+                var handlers = _inMemorySubscriptionManager.GetHandlersForEvent(routingKey);
+                var handlersCount = handlers.Count();
+
+                var handleTasks = new Task<bool>[handlersCount];
+
+                var k = 0;
                 foreach (var handler in handlers)
                 {
-                    var policyContext = new Context(eventName);
-
-                    var policyBuilder = Policy
-                        .HandleResult<bool>(successfullyExecution => !successfullyExecution)
-                        .Or<Exception>();
-
-                    var policy = policyBuilder
-                        .WaitAndRetryAsync(_consumeRetryAttempts, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)))
-                        .WithPolicyKey(eventName);
-
-                    var policyExecution = await policy.ExecuteAsync(
-                        async ctx => await ProcessEvent(eventName, message, handler).ConfigureAwait(false), policyContext).ConfigureAwait(false);
-
-                    if (!policyExecution)
+                    var handleTask = Task.Run(async () =>
                     {
-                        // todo: put some dead queue like 'error-queue' redirect here
-                    }
+                        var consumerRetryAttemptsConfigKey = (int)_configuration[ConsumeRetryAttemptsConfigKey];
 
-                    _consumerChannel.BasicAck(eventArgs.DeliveryTag, false);
+                        var policyContext = new Context(routingKey);
+
+                        var policyBuilder = Policy
+                            .HandleResult<bool>(successfullyExecution => !successfullyExecution)
+                            .Or<Exception>();
+
+                        var policy = policyBuilder
+                            .WaitAndRetryAsync(consumerRetryAttemptsConfigKey, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)))
+                            .WithPolicyKey(routingKey);
+
+                        var policyExecution = await policy.ExecuteAndCaptureAsync(
+                            async ctx => await ProcessEvent(routingKey, message, handler).ConfigureAwait(false), policyContext).ConfigureAwait(false);
+
+                        return policyExecution.Outcome == OutcomeType.Successful;
+                    });
+
+                    handleTasks[k] = handleTask;
+                    k++;
+                }
+
+                try
+                {
+                    await Task.WhenAll(handleTasks);
+                }
+                catch (Exception ex)
+                {
+                    // todo: put some dead queue redirect here like 'error-queue' and remove throw
+                    throw ex;
+                }
+                finally
+                {
+                    var channel = ((AsyncEventingBasicConsumer) sender).Model;
+                    channel.BasicAck(eventArgs.DeliveryTag, false);
                 }
             }
         }
@@ -123,9 +156,9 @@ namespace IntegrationBusRabbitMq
             using (var scope = _serviceProvider.CreateScope())
             {
                 var handler = scope.ServiceProvider.GetRequiredService(handlerType);
-                var concreteType = typeof(IIntegrationEventHandler<>).MakeGenericType(integrationEventType);
+                var concreteType = typeof(IIntegrationEventHandler2<>).MakeGenericType(integrationEventType);
 
-                var result = (Task<bool>) concreteType
+                var result = (Task<bool>) handlerType
                     .GetMethod("Handle")
                     .Invoke(handler, new[] { integrationEvent });
 
@@ -134,65 +167,93 @@ namespace IntegrationBusRabbitMq
 
         }
 
-        public void Publish(IntegrationEvent @event)
+        public bool Publish(IntegrationEvent @event)
         {
             if (!_connectionPersister.IsConnected) _connectionPersister.TryConnect();
+
+            var publishRetryAttempts = (int) _configuration[PublishRetryAttemptsConfigKey];
 
             var policyBuilder = Policy
-                .Handle<BrokerUnreachableException>()
-                .Or<SocketException>();
+                    .Handle<BrokerUnreachableException>()
+                    .Or<SocketException>();
 
             var policy = policyBuilder.WaitAndRetry(
-                _publishRetryAttempts,
+                publishRetryAttempts,
                 retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)));
 
-            CreateModelAndPublish(@event, policy);
+            var policyResult = policy.ExecuteAndCapture(() => CreateModelAndPublish(@event));
+
+            return policyResult.Outcome == OutcomeType.Successful;
         }
 
-        private void CreateModelAndPublish(IntegrationEvent @event, RetryPolicy policy)
+        private void CreateModelAndPublish(IntegrationEvent @event)
         {
-            using (var channel = _connectionPersister.CreateModel())
-            {
-                var eventName = @event.GetType().Name;
+            var channel = _connectionPersister.TakeAChannel();
+            
+            var eventName = @event.GetType().Name;
 
-                channel.ExchangeDeclare(_brokerName, BrokerType);
+            channel.ExchangeDeclare(_gatewayBrokerName, GatewayBrokerType);
 
-                var message = JsonConvert.SerializeObject(@event);
-                var body = Encoding.UTF8.GetBytes(message);
+            var message = JsonConvert.SerializeObject(@event);
+            var body = Encoding.UTF8.GetBytes(message);
 
-                policy.Execute(() =>
-                {
-                    var properties = channel.CreateBasicProperties();
-                    properties.DeliveryMode = 2;
+            var properties = channel.CreateBasicProperties();
+            properties.DeliveryMode = 2;
 
-                    channel.BasicPublish(_brokerName, eventName, true, properties, body);
-                });
-            }
+            channel.BasicPublish(_gatewayBrokerName, eventName, true, properties, body);
+
+            _connectionPersister.GiveChannel(channel);            
         }
 
-        public void Subscribe<TEvent, TEventHandler>() where TEvent : IntegrationEvent where TEventHandler : IIntegrationEventHandler<TEvent>
+        public ISubscription Subscribe<TEvent, TEventHandler>(int consumersAmount = -1) 
+            where TEvent : IntegrationEvent
+            where TEventHandler : IIntegrationEventHandler<TEvent>
         {
             var eventName = typeof(TEvent).Name;
-            DoInternalSubscription(eventName);
+            var subscriptionName = typeof(TEventHandler).Name;
 
-            _inMemorySubscriptionManager.AddEventSubscription<TEvent, TEventHandler>();
-            StartBasicConsume();
+            var consumeConcurrentsDefaultAmount = (int) _configuration[ConsumeConcurrentsDefaultAmountConfigKey];
+            if (consumersAmount <= 0) consumersAmount = consumeConcurrentsDefaultAmount;
+            
+            DeclareQueueAndOpenConsumers(queueNameSuffix: subscriptionName, routingKey: eventName, consumersAmount);
+
+            var subscription 
+                = _inMemorySubscriptionManager.AddAndRetrieveEventSubscription<TEvent, TEventHandler>();
+
+            return subscription;
         }
 
-        private void DoInternalSubscription(string eventName)
+        private void DeclareQueueAndOpenConsumers(string queueNameSuffix, string routingKey, int consumersAmount)
         {
-            var containsKey = _inMemorySubscriptionManager.HasHandlerForEvent(eventName);
-            if (containsKey) return;
+            //var containsKey = _inMemorySubscriptionManager.HasHandlerForEvent(queueAndRoutingKey);
+            //if (containsKey) return;
 
             if (!_connectionPersister.IsConnected) _connectionPersister.TryConnect();
 
-            using (var channel = _connectionPersister.CreateModel())
-                channel.QueueBind(_queueName, _brokerName, eventName);
+            var channel = _connectionPersister.TakeAChannel();
+
+            var queueName = $"{routingKey}#{queueNameSuffix}";
+            var eventBrokerName = $"{_serviceName}#{routingKey}";
+
+            channel.ExchangeDeclare(_gatewayBrokerName, GatewayBrokerType);
+
+            channel.ExchangeDeclare(eventBrokerName, ServiceBrokerType);
+            channel.ExchangeBind(eventBrokerName, _gatewayBrokerName, routingKey);
+
+            channel.QueueDeclare(queueName, true, false, false, null);
+            channel.QueueBind(queueName, eventBrokerName, "");
+
+            for (var c = 1; c <= consumersAmount; c++)
+            {
+                var consumeChannel = _connectionPersister.TakeAChannel();
+                StartBasicConsume(consumeChannel, queueName, $"{queueName}#{c}");
+            }           
         }
+
+        public void EnableConsume() => _enableConsume = true;
 
         public void Dispose()
         {
-            _consumerChannel?.Dispose();
             _inMemorySubscriptionManager.Clear();
         }
     }

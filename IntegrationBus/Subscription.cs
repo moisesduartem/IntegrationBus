@@ -4,7 +4,12 @@ using System.Linq;
 
 namespace IntegrationBus
 {
-    public class Subscription
+    public interface ISubscription
+    {
+        ISubscription And<THandler>();
+    }
+
+    public class Subscription : ISubscription
     {
         public IReadOnlyList<Type> EventHandlerTypes => _eventHandlerTypes.ToList();
         private readonly IList<Type> _eventHandlerTypes;
@@ -17,9 +22,15 @@ namespace IntegrationBus
             EventType = eventType;
         }
 
-        public void AddHandler(Type handlerType)
+        public void AddHandler(Type handlerType) => _eventHandlerTypes.Add(handlerType);
+
+        public ISubscription And<THandler>()
         {
-            _eventHandlerTypes.Add(handlerType);
+            var handlerType = typeof(THandler);
+            AddHandler(handlerType);
+
+            return this;
         }
+        
     }
 }

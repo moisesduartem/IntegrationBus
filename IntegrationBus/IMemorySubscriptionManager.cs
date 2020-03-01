@@ -10,7 +10,7 @@ namespace IntegrationBus
         /// </summary>
         /// <typeparam name="TEvent"></typeparam>
         /// <typeparam name="TEventHandler"></typeparam>
-        void AddEventSubscription<TEvent, TEventHandler>() 
+        ISubscription AddAndRetrieveEventSubscription<TEvent, TEventHandler>() 
             where TEvent : IntegrationEvent
             where TEventHandler : IIntegrationEventHandler<TEvent>;
 
@@ -33,3 +33,4 @@ namespace IntegrationBus
         void Clear();
     }
 }
+

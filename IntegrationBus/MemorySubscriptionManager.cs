@@ -15,25 +15,32 @@ namespace IntegrationBus
             _subscriptions = new Dictionary<string, Subscription>();
         }
        
-        public void AddEventSubscription<TEvent, TEventHandler>() 
+        public ISubscription AddAndRetrieveEventSubscription<TEvent, TEventHandler>() 
             where TEvent : IntegrationEvent 
             where TEventHandler : IIntegrationEventHandler<TEvent>
         {
             var eventType = typeof(TEvent);
             var eventHandlerType = typeof(TEventHandler);
 
-            if (!_subscriptions.ContainsKey(eventType.Name))
+            if (!HasHandlerForEvent(eventType.Name))
             {
-                var subscription = new Subscription(eventType);
-                _subscriptions.Add(eventType.Name, subscription);
+                var newSubscription = new Subscription(eventType);
+                newSubscription.AddHandler(eventHandlerType);
+
+                _subscriptions.Add(eventType.Name, newSubscription);
+
+                return newSubscription;
             }
 
             if (_subscriptions[eventType.Name].EventHandlerTypes.Any(h => h == eventHandlerType))
-                throw new SubscriptionException(eventHandlerType, eventType.Name);
+                throw new SubscriptionDuplicateException(eventHandlerType, eventType.Name);
 
-            _subscriptions[eventType.Name].AddHandler(eventHandlerType);
+            var subscription = _subscriptions[eventType.Name];
+            subscription.AddHandler(eventHandlerType);
+
+            return subscription;
         }
-        
+
         public IEnumerable<Type> GetHandlersForEvent(string eventName) => _subscriptions[eventName].EventHandlerTypes;
 
         public Type GetEventType(string eventName) => _subscriptions[eventName].EventType;

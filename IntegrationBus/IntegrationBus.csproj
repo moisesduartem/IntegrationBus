@@ -12,4 +12,8 @@
     <PackageTags>rabbitmq, microservice, eventbus</PackageTags>
   </PropertyGroup>
 
+  <ItemGroup>
+    <Folder Include="Bus\SubscriptionHolders\" />
+  </ItemGroup>
+
 </Project>
